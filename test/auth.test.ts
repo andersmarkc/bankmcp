@@ -147,3 +147,44 @@ test("well-known MCP client domains are allowed by default", async () => {
   for (const u of ["https://claude.ai/api/mcp/auth_callback", "https://chatgpt.com/connector_platform_oauth_redirect", "https://chat.mistral.ai/oauth/callback", "https://cursor.com/oauth/callback", "http://localhost:3456/cb"]) assert.equal(redirectAllowed(u), true, u);
   for (const u of ["https://evil.example/cb", "https://chatgpt.com.evil.example/cb", "https://notclaude.ai/cb"]) assert.equal(redirectAllowed(u), false, u);
 });
+
+// Clients only use their refresh token after a 401 with WWW-Authenticate. Anything else (the 400
+// invalid_client this used to give) makes them drop the connection once the hour-long access token expires.
+test("an expired or unknown access token is rejected as invalid_token, which /mcp answers with 401", async () => {
+  const { InvalidTokenError } = await import("@modelcontextprotocol/sdk/server/auth/errors.js");
+  const { requireBearerAuth } = await import("@modelcontextprotocol/sdk/server/auth/middleware/bearerAuth.js");
+  const express = (await import("express")).default;
+
+  const store = new Store(join(mkdtempSync(join(tmpdir(), "bank-")), "store.json"));
+  const provider = new SingleUserProvider(store);
+  const client = await provider.clientsStore.registerClient!({ redirect_uris: ["https://cursor.com/agents/mcp/oauth/callback"], client_name: "Cursor", token_endpoint_auth_method: "none" });
+  const { out, res } = fakeRes();
+  await provider.authorize(client, { codeChallenge: "c", redirectUri: client.redirect_uris[0]! }, res);
+  const id = /name="request" value="([^"]+)"/.exec(out.body)![1]!;
+  const ok = provider.completeLogin(id, "correct horse", "1.2.3.4");
+  assert.ok("redirect" in ok);
+  const tokens = await provider.exchangeAuthorizationCode(client, new URL(ok.redirect).searchParams.get("code")!, undefined, client.redirect_uris[0]);
+  for (const t of Object.values(store.data.oauth.tokens)) if (t.kind === "access") t.expires = Math.floor(Date.now() / 1000) - 1;
+
+  await assert.rejects(provider.verifyAccessToken(tokens.access_token), (e) => e instanceof InvalidTokenError && /expired/.test((e as Error).message));
+  await assert.rejects(provider.verifyAccessToken("never-issued"), (e) => e instanceof InvalidTokenError);
+
+  const app = express();
+  app.post("/mcp", requireBearerAuth({ verifier: provider, resourceMetadataUrl: "http://localhost:8080/.well-known/oauth-protected-resource/mcp" }), (_req, r) => void r.json({ ok: true }));
+  const server = app.listen(0);
+  try {
+    const port = (server.address() as import("node:net").AddressInfo).port;
+    for (const bearer of [tokens.access_token, "never-issued"]) {
+      const r = await fetch(`http://127.0.0.1:${port}/mcp`, { method: "POST", headers: { authorization: `Bearer ${bearer}` } });
+      assert.equal(r.status, 401);
+      assert.match(r.headers.get("www-authenticate") ?? "", /error="invalid_token"/);
+      assert.equal(((await r.json()) as { error: string }).error, "invalid_token");
+    }
+    // The refresh token still works, which is what the client does next.
+    const refreshed = await provider.exchangeRefreshToken(client, tokens.refresh_token!);
+    const r = await fetch(`http://127.0.0.1:${port}/mcp`, { method: "POST", headers: { authorization: `Bearer ${refreshed.access_token}` } });
+    assert.equal(r.status, 200);
+  } finally {
+    server.close();
+  }
+});
